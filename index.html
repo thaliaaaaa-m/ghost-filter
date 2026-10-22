@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ghost Filter</title>
+<style>
+:root{color-scheme:dark}
+html,body{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;overflow:hidden}
+#stage{position:fixed;left:50%;top:0;transform:translateX(-50%);background:#000;overflow:hidden}
+#vid,#gl{position:absolute;inset:0;width:100%;height:100%;display:block}
+#vid{transform:scaleX(-1);object-fit:cover}
+#panel{position:fixed;left:0;right:0;bottom:0;padding:12px 14px calc(12px + env(safe-area-inset-bottom,0px));display:flex;flex-wrap:wrap;gap:10px 16px;justify-content:center;align-items:center;background:linear-gradient(transparent,rgba(0,0,0,.75));font-size:13px}
+button{background:#fff;color:#000;border:0;border-radius:999px;padding:10px 18px;font-size:15px;font-weight:600;cursor:pointer}
+button.rec{background:#ff3b30;color:#fff}
+label{display:flex;align-items:center;gap:6px;color:#cfcfcf}
+input[type=range]{width:90px}
+#msg{position:fixed;top:calc(12px + env(safe-area-inset-top,0px));left:0;right:0;text-align:center;color:#cfcfcf;font-size:13px;padding:0 16px;pointer-events:none}
+</style></head><body>
+<div id="stage"><video id="vid" playsinline muted></video><canvas id="gl"></canvas></div>
+<div id="msg">Loading face tracker…</div>
+<div id="panel">
+ <button id="start" disabled>Start camera</button>
+ <button id="rec" class="rec" disabled>● Record</button>
+ <label>Opacity <input id="op" type="range" min="0.3" max="1" step="0.01" value="0.88"></label>
+ <label>Size <input id="sz" type="range" min="0.7" max="1.8" step="0.01" value="1"></label>
+ <label>Turn <input id="tn" type="range" min="1" max="2" step="0.01" value="1.3"></label>
+ <label><input id="showcam" type="checkbox" checked> Camera</label>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script type="module">
+import {FaceLandmarker,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const WASM="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL="https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const MAXF=4;                 // max people / ghosts at once
+const ROT_FIX=[1,-1,-1];      // flip a sign if head rotation feels inverted (x pitch, y yaw, z roll)
+const AWAY_MS=2500;           // how long the ghost keeps showing its back after you turn away
+
+const $=id=>document.getElementById(id);
+const stage=$('stage'),vid=$('vid'),glc=$('gl'),msg=$('msg'),startB=$('start'),recB=$('rec'),opS=$('op'),szS=$('sz'),tnS=$('tn'),showCam=$('showcam');
+let W=640,H=480;
+const lerp=(a,b,t)=>a+(b-a)*t;
+
+// ---------- three.js ----------
+const renderer=new THREE.WebGLRenderer({canvas:glc,antialias:true,alpha:true,preserveDrawingBuffer:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const scene=new THREE.Scene();
+const cam=new THREE.OrthographicCamera(-1,1,1,-1,-3000,3000);cam.position.z=1000;
+scene.add(new THREE.HemisphereLight(0xffffff,0x445577,.9));
+const dl=new THREE.DirectionalLight(0xffffff,.8);dl.position.set(.4,.7,.8);scene.add(dl);
+
+// ghost silhouette traced from the artwork, puffed up, pivot at eye midpoint
+const P=(x,y)=>[(x-925)/450-.313,(1026-y)/450-.38];
+const sh=new THREE.Shape();
+sh.moveTo(...P(960,452));
+[[1150,452,1330,600,1365,800],[1400,1000,1400,1200,1270,1420],[1190,1550,1010,1650,948,1500],[850,1580,700,1620,620,1520],
+ [580,1450,590,1390,632,1325],[560,1360,440,1370,452,1270],[455,1240,465,1225,470,1210],[510,1140,535,1080,542,1020],
+ [550,950,552,880,560,860],[565,800,575,760,585,730],[640,560,790,452,960,452]]
+ .forEach(a=>sh.bezierCurveTo(...P(a[0],a[1]),...P(a[2],a[3]),...P(a[4],a[5])));
+const depth=.9,bt=.5;
+const geo=new THREE.ExtrudeGeometry(sh,{depth,bevelEnabled:true,bevelThickness:bt,bevelSize:.3,bevelSegments:14,curveSegments:48});
+geo.translate(0,0,-depth/2);
+geo.computeVertexNormals();
+{const p=geo.attributes.position,n=geo.attributes.normal,mp=new Map(),key=i=>Math.round(p.getX(i)*500)+','+Math.round(p.getY(i)*500)+','+Math.round(p.getZ(i)*500);
+ for(let i=0;i<p.count;i++){const k=key(i);let a=mp.get(k);if(!a){a=[0,0,0];mp.set(k,a)}a[0]+=n.getX(i);a[1]+=n.getY(i);a[2]+=n.getZ(i)}
+ for(let i=0;i<p.count;i++){const a=mp.get(key(i)),l=Math.hypot(...a)||1;n.setXYZ(i,a[0]/l,a[1]/l,a[2]/l)}}
+
+// matte, slightly translucent felt-like material (hem wobble runs on the GPU so ghosts share one mesh)
+const mat=new THREE.ShaderMaterial({
+ transparent:true,
+ uniforms:{uOp:{value:.88},uT:{value:0}},
+ vertexShader:`uniform float uT;varying vec3 vN;varying vec3 vO;
+  void main(){
+   vec3 p=position;float k=clamp((-.18-p.y)/1.1,0.,1.);
+   p.x+=sin(uT*3.+p.y*4.+p.x*2.)*.04*k;p.y+=sin(uT*2.4+p.x*3.)*.02*k;
+   vN=normalize(normalMatrix*normal);vO=position;
+   gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.);}`,
+ fragmentShader:`uniform float uOp;varying vec3 vN;varying vec3 vO;
+  float h(vec3 p){return fract(sin(dot(p,vec3(12.9898,78.233,37.719)))*43758.5453);}
+  void main(){
+   vec3 n=normalize(vN);vec3 L=normalize(vec3(.4,.7,.8));
+   float w=dot(n,L)*.5+.5;
+   float fr=pow(1.-max(n.z,0.),2.5);
+   vec3 col=mix(vec3(.66,.72,.84),vec3(.97,.97,.98),smoothstep(.1,.95,w));
+   col+=vec3(.7,.78,.95)*fr*.1;
+   col+=(h(floor(vO*150.))-.5)*.06;
+   float a=uOp*mix(.86,1.,fr);
+   gl_FragColor=vec4(col,a);}`
+});
+
+const eyeMat=new THREE.MeshStandardMaterial({color:0x050507,roughness:.2,metalness:.05});
+const hiMat=new THREE.MeshBasicMaterial({color:0xffffff});
+const sph=new THREE.SphereGeometry(1,24,24),sphS=new THREE.SphereGeometry(1,10,10);
+const zf=depth/2+bt-.03;
+const eyeBase=[[970,855],[1162,855]].map(p=>P(...p));
+
+function makeGhost(){
+ const body=new THREE.Mesh(geo,mat);
+ const eyes=eyeBase.map(q=>{
+  const g=new THREE.Group();g.position.set(q[0],q[1],zf);
+  const e=new THREE.Mesh(sph,eyeMat);e.scale.set(.125,.205,.06);g.add(e);
+  const h1=new THREE.Mesh(sphS,hiMat);h1.scale.set(.03,.045,.01);h1.position.set(-.025,.09,.06);g.add(h1);
+  const h2=new THREE.Mesh(sphS,hiMat);h2.scale.set(.016,.022,.01);h2.position.set(.035,-.07,.06);g.add(h2);
+  body.add(g);return g});
+ const mouth=new THREE.Mesh(sph,eyeMat);mouth.position.set(0,-.42,zf);body.add(mouth);
+ const group=new THREE.Group();group.add(body);group.visible=false;group.scale.setScalar(.01);scene.add(group);
+ return {group,body,eyes,mouth,bs:{},sm:{},tPos:new THREE.Vector3(),tQ:new THREE.Quaternion(),tS:0,on:false,away:false,awayUntil:0,lost:0,yaw:0,pitch:0};
+}
+const ghosts=Array.from({length:MAXF},makeGhost);
+
+function fit(){
+ const vw=vid.videoWidth||640,vh=vid.videoHeight||480,ar=vw/vh;
+ let w=innerWidth,h=w/ar;if(h>innerHeight){h=innerHeight;w=h*ar}
+ W=Math.round(w);H=Math.round(h);
+ stage.style.width=W+'px';stage.style.height=H+'px';stage.style.top=((innerHeight-H)/2)+'px';
+ renderer.setSize(W,H,false);
+ cam.left=-W/2;cam.right=W/2;cam.top=H/2;cam.bottom=-H/2;cam.updateProjectionMatrix();
+}
+addEventListener('resize',fit);fit();
+
+// ---------- tracking ----------
+let lm,lastT=-1;
+(async()=>{
+ try{
+  const fs=await FilesetResolver.forVisionTasks(WASM);
+  lm=await FaceLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:MODEL,delegate:'GPU'},runningMode:'VIDEO',numFaces:MAXF,outputFaceBlendshapes:true,outputFacialTransformationMatrixes:true});
+  msg.textContent='Ready. Press Start camera.';startB.disabled=false;
+ }catch(e){msg.textContent='Could not load the face tracker (needs internet for the CDN and model). '+e.message}
+})();
+startB.onclick=async()=>{
+ try{
+  const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280},height:{ideal:720}},audio:false});
+  vid.srcObject=st;await vid.play();fit();startB.style.display='none';recB.disabled=false;msg.textContent='';
+ }catch(e){msg.textContent='Camera blocked. Open this page via http://localhost (not a file) and allow camera access.'}
+};
+showCam.onchange=()=>{vid.style.visibility=showCam.checked?'visible':'hidden'};
+
+const mtx=new THREE.Matrix4(),dp=new THREE.Vector3(),dq=new THREE.Quaternion(),ds=new THREE.Vector3(),eu=new THREE.Euler(0,0,0,'YXZ');
+function lose(G,now){
+ if(!G.on)return;
+ if(++G.lost<=4)return;                       // short grace for dropped frames
+ if(Math.abs(G.yaw)>.6){                      // turned away: keep turning to show the back
+  G.on=false;G.away=true;G.awayUntil=now+AWAY_MS;
+  eu.set(G.pitch,Math.sign(G.yaw)*Math.PI,0,'YXZ');G.tQ.setFromEuler(eu);
+ }else G.on=false;
+}
+function update(now){
+ if(!lm||vid.readyState<2||vid.currentTime===lastT)return;lastT=vid.currentTime;
+ const r=lm.detectForVideo(vid,now);
+ const faces=r.faceLandmarks||[];
+ const gain=parseFloat(tnS.value),size=parseFloat(szS.value);
+ const dets=faces.map((f,i)=>{
+  const a=f[33],b=f[263];
+  const eyeD=Math.hypot((a.x-b.x)*W,(a.y-b.y)*H);
+  const pos=new THREE.Vector3((1-(a.x+b.x)/2)*W-W/2,H/2-((a.y+b.y)/2)*H,0);
+  const d={pos,eyeD,q:new THREE.Quaternion(),yaw:0,pitch:0,rawYaw:0,bs:{}};
+  const m=r.facialTransformationMatrixes&&r.facialTransformationMatrixes[i];
+  if(m){
+   mtx.fromArray(m.data).decompose(dp,dq,ds);
+   d.q.set(dq.x*ROT_FIX[0],dq.y*ROT_FIX[1],dq.z*ROT_FIX[2],dq.w);
+   eu.setFromQuaternion(d.q,'YXZ');d.rawYaw=eu.y;
+   eu.y=Math.max(-Math.PI*.95,Math.min(Math.PI*.95,eu.y*gain));
+   eu.x=Math.max(-1.2,Math.min(1.2,eu.x*gain));
+   d.q.setFromEuler(eu);d.yaw=eu.y;d.pitch=eu.x;
+  }
+  const bsr=r.faceBlendshapes&&r.faceBlendshapes[i];
+  if(bsr)for(const c of bsr.categories)d.bs[c.categoryName]=c.score;
+  return d;
+ });
+ // keep each person on the same ghost by matching to the nearest previous position
+ const used=new Set();
+ dets.forEach(d=>{
+  let best=-1,bd=1e9;
+  ghosts.forEach((G,j)=>{if(used.has(j)||!G.on)return;const dd=G.tPos.distanceTo(d.pos);if(dd<bd){bd=dd;best=j}});
+  if(best<0||bd>d.eyeD*2.5){best=ghosts.findIndex((G,j)=>!used.has(j)&&!G.on&&!G.away);if(best<0)best=ghosts.findIndex((G,j)=>!used.has(j)&&!G.on);if(best<0)return}
+  used.add(best);const G=ghosts[best];
+  G.tPos.copy(d.pos);G.tS=d.eyeD/Math.max(.55,Math.cos(Math.min(1.0,Math.abs(d.rawYaw))))*1.14*size;
+  G.tQ.copy(d.q);G.yaw=d.yaw;G.pitch=d.pitch;G.bs=d.bs;G.on=true;G.away=false;G.lost=0;
+ });
+ ghosts.forEach((G,j)=>{if(!used.has(j))lose(G,now)});
+}
+
+// ---------- recording ----------
+let rc,rctx,recorder,chunks=[],recording=false;
+recB.onclick=()=>{
+ if(!recording){
+  rc=document.createElement('canvas');rc.width=W;rc.height=H;rctx=rc.getContext('2d');
+  chunks=[];recorder=new MediaRecorder(rc.captureStream(30),{mimeType:'video/webm'});
+  recorder.ondataavailable=e=>chunks.push(e.data);
+  recorder.onstop=()=>{const u=URL.createObjectURL(new Blob(chunks,{type:'video/webm'}));const l=document.createElement('a');l.href=u;l.download='ghost-filter.webm';l.click()};
+  recorder.start();recording=true;recB.textContent='■ Stop';
+ }else{recorder.stop();recording=false;recB.textContent='● Record'}
+};
+
+// ---------- per-ghost animation ----------
+function animate(G){
+ const g=n=>G.bs[n]||0,S=(k,v,t)=>G.sm[k]=lerp(G.sm[k]||0,v,t);
+ const bl=S('bl',g('eyeBlinkLeft'),.8),br=S('br',g('eyeBlinkRight'),.8);
+ const bd=S('bd',(g('browDownLeft')+g('browDownRight'))/2,.5);
+ const bi=S('bi',g('browInnerUp'),.5),bo=S('bo',(g('browOuterUpLeft')+g('browOuterUpRight'))/2,.5);
+ const up=1+bo*.25+bi*.1,[eL,eR]=G.eyes;
+ eL.scale.set(1,Math.max(.06,1-bl*.94)*up,1);eR.scale.set(1,Math.max(.06,1-br*.94)*up,1);
+ const tilt=(bi-bd)*.55;eL.rotation.z=tilt;eR.rotation.z=-tilt;
+ const lk=(i,o,u,d)=>[(S(i,g(i),.5)-S(o,g(o),.5))*.05,(S(u,g(u),.5)-S(d,g(d),.5))*.05];
+ const L=lk('eyeLookInLeft','eyeLookOutLeft','eyeLookUpLeft','eyeLookDownLeft');
+ const R=lk('eyeLookOutRight','eyeLookInRight','eyeLookUpRight','eyeLookDownRight');
+ eL.position.set(eyeBase[0][0]+L[0],eyeBase[0][1]+L[1],zf);
+ eR.position.set(eyeBase[1][0]+R[0],eyeBase[1][1]+R[1],zf);
+ const jaw=S('jaw',g('jawOpen'),.6),sm=S('sm',(g('mouthSmileLeft')+g('mouthSmileRight'))/2,.5),pk=S('pk',g('mouthPucker'),.5);
+ const mh=Math.max(jaw*.3,sm*.035),mw=Math.max(.03,.07+sm*.14-pk*.04+jaw*.02);
+ G.mouth.visible=mh>.012;G.mouth.scale.set(mw,Math.max(mh,.012),.05);G.mouth.position.y=-.42-jaw*.06;
+ const puff=S('pf',g('cheekPuff'),.4);G.body.scale.set(1+puff*.1,1+puff*.04,1+puff*.1);
+}
+
+// ---------- loop ----------
+function frame(now){
+ update(now);
+ mat.uniforms.uOp.value=parseFloat(opS.value);mat.uniforms.uT.value=now/1000;
+ for(const G of ghosts){
+  if(G.away&&now>G.awayUntil)G.away=false;
+  const vis=G.on||G.away,grp=G.group;
+  if(vis&&!grp.visible){grp.position.copy(G.tPos);grp.quaternion.copy(G.tQ);grp.scale.setScalar(Math.max(G.tS*.3,1));grp.visible=true}
+  if(vis){grp.position.lerp(G.tPos,G.away?.1:.5);grp.quaternion.slerp(G.tQ,G.away?.1:.5)}
+  const sT=vis?G.tS:0,cs=grp.scale.x,ns=lerp(cs,sT,.25);
+  grp.scale.setScalar(ns);if(!vis&&ns<2)grp.visible=false;
+  if(grp.visible)animate(G);
+ }
+ renderer.render(scene,cam);
+ if(recording&&rctx){
+  rctx.fillStyle='#000';rctx.fillRect(0,0,rc.width,rc.height);
+  if(showCam.checked){rctx.save();rctx.translate(rc.width,0);rctx.scale(-1,1);rctx.drawImage(vid,0,0,rc.width,rc.height);rctx.restore()}
+  rctx.drawImage(glc,0,0,rc.width,rc.height);
+ }
+ requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script></body></html>
